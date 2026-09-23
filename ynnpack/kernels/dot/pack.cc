@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 
 #include "ynnpack/base/arithmetic.h"
@@ -97,6 +98,83 @@ void packer::pack(size_t m, size_t n, size_t input_stride, const void* input,
     }
   } else {
     YNN_UNREACHABLE;
+  }
+}
+
+// Packs a 2D row-major matrix A of shape [m, k] into 2D row-major tiles of
+// shape [block_m, tile_k], zero-padding partial tiles at the m and k
+// boundaries.
+//
+// Before (`input`, shape [m, k], row stride `input_stride` bytes):
+//   input(r, c) is at byte offset: r * input_stride + c * elem_size
+//
+//   Example (m = 3, k = 5, block_m = 2, tile_k = 3):
+//     [ a00 a01 a02 | a03 a04 ]
+//     [ a10 a11 a12 | a13 a14 ]
+//     --------------+----------
+//     [ a20 a21 a22 | a23 a24 ]
+//
+// After (`output`, [output_m_blocks, output_k_blocks] tiles of
+// [block_m, tile_k]):
+//   Each tile (mo, ko) is contiguous row-major of shape [block_m, tile_k],
+//   where r = mo * block_m + mi and c = ko * tile_k + ki:
+//   output(mo, ko, mi, ki) is at byte offset:
+//     mo * output_mo_stride + ko * output_ko_stride +
+//     (mi * tile_k + ki) * elem_size
+//
+//   Tile (mo=0, ko=0) [offset: 0 * output_mo_stride + 0 * output_ko_stride]:
+//     [ a00 a01 a02 ]
+//     [ a10 a11 a12 ]
+//   Tile (mo=0, ko=1) [offset: 0 * output_mo_stride + 1 * output_ko_stride]:
+//     [ a03 a04  0  ]  <-- k padded to tile_k
+//     [ a13 a14  0  ]
+//   Tile (mo=1, ko=0) [offset: 1 * output_mo_stride + 0 * output_ko_stride]:
+//     [ a20 a21 a22 ]
+//     [  0   0   0  ]  <-- m padded to block_m
+//   Tile (mo=1, ko=1) [offset: 1 * output_mo_stride + 1 * output_ko_stride]:
+//     [ a23 a24  0  ]
+//     [  0   0   0  ]
+void pack_a(size_t m, size_t k, size_t block_m, size_t tile_k, size_t elem_size,
+            size_t input_stride, const void* input, size_t output_ko_stride,
+            size_t output_mo_stride, void* output, size_t output_m_blocks,
+            size_t output_k_blocks) {
+  const size_t tile_k_bytes = tile_k * elem_size;
+  const size_t k_bytes = k * elem_size;
+  if (output_k_blocks == 0) {
+    output_k_blocks = ceil_div(k, tile_k);
+  }
+  if (output_m_blocks == 0) {
+    output_m_blocks = ceil_div(m, block_m);
+  }
+  const auto* in_bytes = static_cast<const uint8_t*>(input);
+  auto* out_bytes = static_cast<uint8_t*>(output);
+
+  for (size_t block_m_i = 0; block_m_i < output_m_blocks; ++block_m_i) {
+    const size_t m_begin = block_m_i * block_m;
+    const size_t m_avail = std::min(block_m, sub_sat(m, m_begin));
+    for (size_t block_k_i = 0; block_k_i < output_k_blocks; ++block_k_i) {
+      const size_t k_offset_bytes = block_k_i * tile_k_bytes;
+      const size_t k_avail_bytes =
+          (k_offset_bytes < k_bytes)
+              ? std::min(tile_k_bytes, k_bytes - k_offset_bytes)
+              : 0;
+      const size_t k_pad_bytes = tile_k_bytes - k_avail_bytes;
+
+      uint8_t* out = out_bytes + block_k_i * output_ko_stride +
+                     block_m_i * output_mo_stride;
+      const uint8_t* in = in_bytes + m_begin * input_stride + k_offset_bytes;
+      for (size_t m_i = 0; m_i < m_avail; ++m_i) {
+        memcpy(out, in, k_avail_bytes);
+        if (k_pad_bytes > 0) {
+          memset(out + k_avail_bytes, 0, k_pad_bytes);
+        }
+        out += tile_k_bytes;
+        in += input_stride;
+      }
+      if (m_avail < block_m) {
+        memset(out, 0, (block_m - m_avail) * tile_k_bytes);
+      }
+    }
   }
 }
 
